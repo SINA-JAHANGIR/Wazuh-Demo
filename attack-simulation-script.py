@@ -92,6 +92,33 @@ def get_delay(min_delay: float, max_delay: float) -> float:
     return random.uniform(min_delay, max_delay)
 
 
+def count_source_lines(source_path: Path, skip_empty: bool) -> int:
+    """
+    Count total injectable lines in source file.
+    If skip_empty is enabled, empty lines are not counted.
+    """
+    total = 0
+
+    with source_path.open("r", encoding="utf-8", errors="replace") as src:
+        for line in src:
+            if skip_empty and not line.strip():
+                continue
+            total += 1
+
+    return total
+
+
+def format_progress(current: int, total: int) -> str:
+    """
+    Return formatted progress percentage.
+    """
+    if total <= 0:
+        return "0.00%"
+
+    percent = (current / total) * 100
+    return f"{percent:.2f}%"
+
+
 def replay_logs(
     source_path: Path,
     target_path: Path,
@@ -100,6 +127,7 @@ def replay_logs(
     loop: bool,
     skip_empty: bool,
     fsync_enabled: bool,
+    progress_every: int,
 ) -> None:
     """
     Read log lines from source file and append them to target file one by one.
@@ -107,11 +135,19 @@ def replay_logs(
     total_written = 0
     round_number = 0
 
+    total_lines_per_round = count_source_lines(source_path, skip_empty)
+
     logging.info("Starting log replay")
     logging.info("Source file: %s", source_path)
     logging.info("Target file: %s", target_path)
+    logging.info("Injectable lines per round: %d", total_lines_per_round)
     logging.info("Delay range: %.4f - %.4f seconds", min_delay, max_delay)
     logging.info("Loop mode: %s", "enabled" if loop else "disabled")
+    logging.info("Progress report interval: every %d line(s)", progress_every)
+
+    if total_lines_per_round == 0:
+        logging.warning("Source file has no injectable lines. Nothing to replay.")
+        return
 
     while True:
         round_number += 1
@@ -130,7 +166,10 @@ def replay_logs(
                         return
 
                     if skip_empty and not line.strip():
-                        logging.debug("Skipping empty line at source line %d", line_number)
+                        logging.debug(
+                            "Skipping empty line at source line %d",
+                            line_number,
+                        )
                         continue
 
                     if not line.endswith("\n"):
@@ -145,9 +184,31 @@ def replay_logs(
                     total_written += 1
                     lines_written_this_round += 1
 
+                    should_report_progress = (
+                        lines_written_this_round == 1
+                        or lines_written_this_round % progress_every == 0
+                        or lines_written_this_round == total_lines_per_round
+                    )
+
+                    if should_report_progress:
+                        progress = format_progress(
+                            lines_written_this_round,
+                            total_lines_per_round,
+                        )
+
+                        logging.info(
+                            "Progress round #%d: %s | %d/%d lines | Total written: %d",
+                            round_number,
+                            progress,
+                            lines_written_this_round,
+                            total_lines_per_round,
+                            total_written,
+                        )
+
                     logging.debug(
-                        "Injected line %d from source. Total written: %d",
+                        "Injected source line %d. Round written: %d. Total written: %d",
                         line_number,
+                        lines_written_this_round,
                         total_written,
                     )
 
@@ -162,9 +223,11 @@ def replay_logs(
             raise
 
         logging.info(
-            "Replay round #%d completed. Lines written this round: %d",
+            "Replay round #%d completed. Lines written this round: %d/%d, Progress: %s",
             round_number,
             lines_written_this_round,
+            total_lines_per_round,
+            format_progress(lines_written_this_round, total_lines_per_round),
         )
 
         if not loop:
@@ -180,11 +243,66 @@ def replay_logs(
 
 
 def parse_args():
+    examples = f"""
+Examples:
+
+  Basic usage:
+    sudo python3 web-attack-simulation.py
+
+  Run directly if executable:
+    sudo ./web-attack-simulation.py
+
+  Use default source and target with a small random delay:
+    sudo ./web-attack-simulation.py --min-delay 0.05 --max-delay 0.20
+
+  Faster injection:
+    sudo ./web-attack-simulation.py --min-delay 0.01 --max-delay 0.05
+
+  Slower and more realistic simulation:
+    sudo ./web-attack-simulation.py --min-delay 0.5 --max-delay 2
+
+  Replay logs forever until Ctrl+C:
+    sudo ./web-attack-simulation.py --loop --min-delay 0.1 --max-delay 0.5
+
+  Skip empty lines:
+    sudo ./web-attack-simulation.py --skip-empty
+
+  Show progress every 10 injected lines:
+    sudo ./web-attack-simulation.py --progress-every 10
+
+  Show more internal debug details:
+    sudo ./web-attack-simulation.py --verbose
+
+  Use custom source file:
+    sudo ./web-attack-simulation.py --source custom-attack.log
+
+  Use custom target file:
+    sudo ./web-attack-simulation.py --target /var/log/demo-web-access.log
+
+Default values:
+
+  Source file:
+    {DEFAULT_SOURCE_FILE}
+
+  Target file:
+    {DEFAULT_TARGET_FILE}
+
+Important notes:
+
+  - The source file is only read. It will not be modified or deleted.
+  - The target file is opened in append mode. New logs are added to the end.
+  - Each line in the source file is treated as one log event.
+  - Wazuh detection depends on your Wazuh decoders and rules.
+  - If the target file is under /var/log, you usually need sudo.
+"""
+
     parser = argparse.ArgumentParser(
         description=(
             "Replay web attack logs into a Wazuh-monitored access log file "
             "to simulate live web server logs."
-        )
+        ),
+        epilog=examples,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
     parser.add_argument(
@@ -218,7 +336,7 @@ def parse_args():
     parser.add_argument(
         "--loop",
         action="store_true",
-        help="Replay the source file repeatedly until stopped.",
+        help="Replay the source file repeatedly until stopped with Ctrl+C.",
     )
 
     parser.add_argument(
@@ -233,6 +351,16 @@ def parse_args():
         help=(
             "Force syncing each written line to disk. "
             "Slower, but useful if you want immediate persistence."
+        ),
+    )
+
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=25,
+        help=(
+            "Show progress every N injected lines in each round. "
+            "Default: 25"
         ),
     )
 
@@ -252,6 +380,10 @@ def main() -> int:
 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
+
+    if args.progress_every <= 0:
+        logging.error("--progress-every must be greater than 0.")
+        return 1
 
     script_dir = Path(__file__).resolve().parent
 
@@ -273,6 +405,7 @@ def main() -> int:
             loop=args.loop,
             skip_empty=args.skip_empty,
             fsync_enabled=args.fsync,
+            progress_every=args.progress_every,
         )
 
     except KeyboardInterrupt:
